@@ -190,22 +190,78 @@ public class NettyMinecraftProxy {
                 return;
             }
 
-            byte pingByte = buffer.readByte();
+            ByteBuf originalPacket = buffer.copy();
+            buffer.clear();
+            byte pingByte = originalPacket.readByte();
             if ((pingByte & 0xFF) != 0xFE) {
                 System.out.println("Invalid old ping packet. Closing connection.");
                 ctx.close();
                 return;
             }
 
+            System.out.println("Getting client IP address.");
+            InetSocketAddress clientAddress = (InetSocketAddress) ctx.channel().remoteAddress();
+            String clientIp = clientAddress.getAddress().getHostAddress();
+
+            System.out.println("Injecting client IP into the packet.");
+            ByteBuf modifiedPacket = injectClientIp(originalPacket, clientIp);
+            originalPacket.release();
+
+            System.out.println("Trying to inject client IP into the packet.");
+
+
             System.out.println("Valid old ping packet received. Forwarding to remote server.");
             // Forward the ping packet to the remote server
-            ByteBuf pingPacket = Unpooled.wrappedBuffer(new byte[]{pingByte});
+            ByteBuf pingPacket = Unpooled.wrappedBuffer(new byte[]{modifiedPacket.readByte()});
             // Print the data being sent
             String hexData = byteBufToHex(pingPacket);
             System.out.println("Sending data to remote server (Hex): " + hexData);
 
-            connectToRemote(ctx, pingPacket);
+            connectToRemote(ctx, modifiedPacket);
         }
+
+        // inject client ip and attach mark and length
+        private ByteBuf injectClientIp(ByteBuf originalPacket, String clientIp) {
+            ByteBuf modifiedPacket = Unpooled.buffer();
+            modifiedPacket.writeBytes(originalPacket); // 複製原始封包
+
+            byte[] marker = "MCIP".getBytes(); // 固定標記
+            byte[] ipBytes = clientIp.getBytes(); // IP 字符串的字節數據
+
+            modifiedPacket.writeBytes(marker); // 插入標記
+            modifiedPacket.writeByte(ipBytes.length); // 插入長度
+            modifiedPacket.writeBytes(ipBytes); // 插入 IP
+            return modifiedPacket;
+        }
+
+        // remove mark and length
+        // 移除插入的 IP 和相關數據
+        private ByteBuf removeInjectedIp(ByteBuf packet) {
+            int readableBytes = packet.readableBytes(); // 獲取可讀字節數
+            if (readableBytes < 5) { // 至少要包含標記(4字節)和長度(1字節)
+                throw new IllegalArgumentException("Packet too short to contain injected data.");
+            }
+
+            // 移動到插入段的起點 (末尾 - 標記 + 長度)
+            packet.readerIndex(readableBytes - 5);
+            byte[] marker = new byte[4];
+            packet.readBytes(marker);
+
+            if (!new String(marker).equals("MCIP")) {
+                throw new IllegalArgumentException("Invalid packet: Missing MCIP marker.");
+            }
+
+            int ipLength = packet.readByte(); // 讀取 IP 長度
+            if (readableBytes < 5 + ipLength) { // 確認封包是否有足夠數據
+                throw new IllegalArgumentException("Packet length mismatch with IP length.");
+            }
+
+            // 返回移除 IP 和相關數據的封包
+            return packet.slice(0, readableBytes - 5 - ipLength);
+        }
+
+
+
 
         private void handleNewProtocol(ChannelHandlerContext ctx) {
             System.out.println("Handling new protocol packet.");
@@ -239,15 +295,27 @@ public class NettyMinecraftProxy {
             buffer.resetReaderIndex();
 
             // Copy the entire buffer to forward to the remote server
-            ByteBuf pendingData = buffer.copy();
+            ByteBuf originalPacket = buffer.copy();
             buffer.clear(); // Clear buffer for future reads
 
-            // Print the data being sent
-            String hexData = byteBufToHex(pendingData);
-            System.out.println("Sending handshake data to remote server (Hex): " + hexData);
+            // Get client IP address
+            InetSocketAddress clientAddress = (InetSocketAddress) ctx.channel().remoteAddress();
+            String clientIp = clientAddress.getAddress().getHostAddress();
+            System.out.println("Injecting client IP: " + clientIp);
 
-            connectToRemote(ctx, pendingData);
+            // Inject the client IP into the packet
+            ByteBuf modifiedPacket = injectClientIp(originalPacket, clientIp);
+
+            // Release the original packet as it is no longer needed
+            originalPacket.release();
+
+            // Print the data being sent
+            String hexData = byteBufToHex(modifiedPacket);
+            System.out.println("Sending handshake data with injected IP to remote server (Hex): " + hexData);
+
+            connectToRemote(ctx, modifiedPacket);
         }
+
 
         private void connectToRemote(ChannelHandlerContext ctx, ByteBuf initialData) {
             System.out.println("Starting DNS resolution for remote host: " + remoteHost + ":" + remotePort);
