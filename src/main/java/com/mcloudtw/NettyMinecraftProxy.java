@@ -184,7 +184,7 @@ public class NettyMinecraftProxy {
         private void handleOldPing(ChannelHandlerContext ctx) {
             System.out.println("Handling old ping packet.");
             // Old ping packets typically start with 0xFE, adjust based on protocol
-            if (buffer.readableBytes() < 1) { // Assuming ping packet has at least 1 byte
+            if (buffer.readableBytes() < 1) { // Ensure there is enough data
                 System.out.println("Not enough data for old ping packet. Waiting for more data.");
                 buffer.resetReaderIndex();
                 return;
@@ -192,6 +192,8 @@ public class NettyMinecraftProxy {
 
             ByteBuf originalPacket = buffer.copy();
             buffer.clear();
+
+            // Verify the ping packet starts with 0xFE
             byte pingByte = originalPacket.readByte();
             if ((pingByte & 0xFF) != 0xFE) {
                 System.out.println("Invalid old ping packet. Closing connection.");
@@ -204,62 +206,33 @@ public class NettyMinecraftProxy {
             String clientIp = clientAddress.getAddress().getHostAddress();
 
             System.out.println("Injecting client IP into the packet.");
-            ByteBuf modifiedPacket = injectClientIp(originalPacket, clientIp);
+            // Inject client IP into the beginning of the packet
+            ByteBuf modifiedPacket = injectClientIpAtStart(originalPacket, clientIp);
             originalPacket.release();
 
-            System.out.println("Trying to inject client IP into the packet.");
-
-
             System.out.println("Valid old ping packet received. Forwarding to remote server.");
-            // Forward the ping packet to the remote server
-            ByteBuf pingPacket = Unpooled.wrappedBuffer(new byte[]{modifiedPacket.readByte()});
-            // Print the data being sent
-            String hexData = byteBufToHex(pingPacket);
-            System.out.println("Sending data to remote server (Hex): " + hexData);
 
+            // Print the data being sent
+            String hexData = byteBufToHex(modifiedPacket);
+            System.out.println("Sending data with injected IP to remote server (Hex): " + hexData);
+
+            // Forward the modified packet to the remote server
             connectToRemote(ctx, modifiedPacket);
         }
 
-        // inject client ip and attach mark and length
-        private ByteBuf injectClientIp(ByteBuf originalPacket, String clientIp) {
+
+        private ByteBuf injectClientIpAtStart(ByteBuf originalPacket, String clientIp) {
             ByteBuf modifiedPacket = Unpooled.buffer();
-            modifiedPacket.writeBytes(originalPacket); // 複製原始封包
 
-            byte[] marker = "MCIP".getBytes(); // 固定標記
-            byte[] ipBytes = clientIp.getBytes(); // IP 字符串的字節數據
+            byte[] ipBytes = clientIp.getBytes();
+            byte[] marker = "MCIP".getBytes();
+            modifiedPacket.writeBytes(marker);
+            modifiedPacket.writeByte(ipBytes.length);
+            modifiedPacket.writeBytes(ipBytes);
+            modifiedPacket.writeBytes(originalPacket);
 
-            modifiedPacket.writeBytes(marker); // 插入標記
-            modifiedPacket.writeByte(ipBytes.length); // 插入長度
-            modifiedPacket.writeBytes(ipBytes); // 插入 IP
             return modifiedPacket;
         }
-
-        // remove mark and length
-        // 移除插入的 IP 和相關數據
-        private ByteBuf removeInjectedIp(ByteBuf packet) {
-            int readableBytes = packet.readableBytes(); // 獲取可讀字節數
-            if (readableBytes < 5) { // 至少要包含標記(4字節)和長度(1字節)
-                throw new IllegalArgumentException("Packet too short to contain injected data.");
-            }
-
-            // 移動到插入段的起點 (末尾 - 標記 + 長度)
-            packet.readerIndex(readableBytes - 5);
-            byte[] marker = new byte[4];
-            packet.readBytes(marker);
-
-            if (!new String(marker).equals("MCIP")) {
-                throw new IllegalArgumentException("Invalid packet: Missing MCIP marker.");
-            }
-
-            int ipLength = packet.readByte(); // 讀取 IP 長度
-            if (readableBytes < 5 + ipLength) { // 確認封包是否有足夠數據
-                throw new IllegalArgumentException("Packet length mismatch with IP length.");
-            }
-
-            // 返回移除 IP 和相關數據的封包
-            return packet.slice(0, readableBytes - 5 - ipLength);
-        }
-
 
 
 
@@ -294,7 +267,7 @@ public class NettyMinecraftProxy {
             // Reset the reader index to the start to forward the entire packet
             buffer.resetReaderIndex();
 
-            // Copy the entire buffer to forward to the remote server
+            // Copy the original buffer to forward to the remote server
             ByteBuf originalPacket = buffer.copy();
             buffer.clear(); // Clear buffer for future reads
 
@@ -303,8 +276,8 @@ public class NettyMinecraftProxy {
             String clientIp = clientAddress.getAddress().getHostAddress();
             System.out.println("Injecting client IP: " + clientIp);
 
-            // Inject the client IP into the packet
-            ByteBuf modifiedPacket = injectClientIp(originalPacket, clientIp);
+            // Inject the client IP into the beginning of the packet
+            ByteBuf modifiedPacket = injectClientIpAtStart(originalPacket, clientIp);
 
             // Release the original packet as it is no longer needed
             originalPacket.release();
