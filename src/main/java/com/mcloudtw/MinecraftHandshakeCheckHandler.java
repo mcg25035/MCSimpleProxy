@@ -13,6 +13,10 @@ import java.net.InetSocketAddress;
 import java.util.LinkedList;
 import java.util.Queue;
 
+// Log4J imports
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 /**
  * 主要用於檢查是否為舊版 Ping (0xFE) 或新版本協議 (Handshake 0x00)，
  * 並在連線前注入客戶端 IP。
@@ -20,11 +24,13 @@ import java.util.Queue;
  */
 public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter {
 
+    private static final Logger logger = LogManager.getLogger(MinecraftHandshakeCheckHandler.class);
     private static final String CLIENT_IP_MARKER = "MCIP";
 
     private final String remoteHost;
     private final int remotePort;
     private final DnsAddressResolverGroup resolverGroup;
+    private boolean firstPacketSent = false;
 
     // 你原本就有的 buffer，用來做「舊/新協議」檢查
     private final ByteBuf buffer = Unpooled.buffer();
@@ -38,8 +44,7 @@ public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter
         this.remoteHost = remoteHost;
         this.remotePort = remotePort;
         this.resolverGroup = resolverGroup;
-        System.out.println("MinecraftHandshakeCheckHandler initialized for remote host: "
-                + remoteHost + ":" + remotePort);
+        logger.info("MinecraftHandshakeCheckHandler initialized for remote host: {}:{}", remoteHost, remotePort);
     }
 
     @Override
@@ -51,10 +56,15 @@ public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        // 1. 先把客戶端送進來的資料放到 pendingQueue，以免還沒連上遠端就先漏了
         ByteBuf in = (ByteBuf) msg;
-        // 為了保險，retain 一份放到 queue
-        pendingQueue.add(in.retainedDuplicate());
+        logger.debug("Data received from client. Buffer: {}", ByteBufUtils.toHexString(in));
+
+        if (firstPacketSent) {
+            pendingQueue.add(in.retainedDuplicate());
+            return;
+        }
+
+        firstPacketSent = true;
 
         // 再把資料累積到你原本用來做判斷的 buffer
         buffer.writeBytes(in);
@@ -62,30 +72,30 @@ public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter
         in.release();
 
         // 2. 以下就是你原本 channelRead 內的檢查流程
-        System.out.println("Data received from client. Buffer size: " + buffer.readableBytes());
+        logger.debug("Data received from client. Buffer size: {}", buffer.readableBytes());
 
         // 觀察 Hex
         ByteBuf duplicate = buffer.copy();
         String hexData = ByteBufUtils.toHexString(duplicate);
         duplicate.release();
-        System.out.println("Received data (Hex): " + hexData);
+        logger.debug("Received data (Hex): {}", hexData);
 
         buffer.markReaderIndex();
         if (!buffer.isReadable()) {
-            System.out.println("Buffer is not readable. Waiting for more data.");
+            logger.debug("Buffer is not readable. Waiting for more data.");
             buffer.resetReaderIndex();
             return;
         }
 
         // 判斷第一 Byte (0xFE => 舊版 Ping)
         int firstByte = buffer.getByte(buffer.readerIndex()) & 0xFF;
-        System.out.println("First byte of packet: " + firstByte);
+        logger.debug("First byte of packet: {}", firstByte);
 
         if (firstByte == 0xFE) {
-            System.out.println("Detected old ping packet.");
+            logger.info("Detected old ping packet.");
             handleOldPing(ctx);
         } else {
-            System.out.println("Detected new protocol packet.");
+            logger.info("Detected new protocol packet.");
             handleNewProtocol(ctx);
         }
     }
@@ -95,7 +105,7 @@ public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter
      */
     private void handleOldPing(ChannelHandlerContext ctx) {
         if (buffer.readableBytes() < 1) {
-            System.out.println("Not enough data for old ping packet. Waiting for more data.");
+            logger.debug("Not enough data for old ping packet. Waiting for more data.");
             buffer.resetReaderIndex();
             return;
         }
@@ -105,7 +115,7 @@ public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter
 
         byte pingByte = originalPacket.readByte();
         if ((pingByte & 0xFF) != 0xFE) {
-            System.out.println("Invalid old ping packet. Closing connection.");
+            logger.warn("Invalid old ping packet. Closing connection.");
             ctx.close();
             originalPacket.release();
             return;
@@ -118,7 +128,7 @@ public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter
         originalPacket.release();
 
         String hexData = ByteBufUtils.toHexString(modifiedPacket);
-        System.out.println("Old ping packet with injected IP (Hex): " + hexData);
+        logger.debug("Old ping packet with injected IP (Hex): {}", hexData);
 
         connectToRemote(ctx, modifiedPacket);
     }
@@ -129,28 +139,28 @@ public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter
     private void handleNewProtocol(ChannelHandlerContext ctx) {
         int length = VarIntUtils.readVarInt(buffer);
         if (length == -1) {
-            System.out.println("VarInt length not fully received. Waiting for more data.");
+            logger.debug("VarInt length not fully received. Waiting for more data.");
             buffer.resetReaderIndex();
             return;
         }
 
         int packetId = VarIntUtils.readVarInt(buffer);
         if (packetId == -1) {
-            System.out.println("VarInt packet ID not fully received. Waiting for more data.");
+            logger.debug("VarInt packet ID not fully received. Waiting for more data.");
             buffer.resetReaderIndex();
             return;
         }
 
         boolean isHandshake = (packetId == 0x00);
-        System.out.println("Packet ID: " + packetId + " | Is handshake: " + isHandshake);
+        logger.debug("Packet ID: {} | Is handshake: {}", packetId, isHandshake);
 
         if (!isHandshake) {
-            System.out.println("Not a handshake packet. Closing connection.");
+            logger.warn("Not a handshake packet. Closing connection.");
             ctx.close();
             return;
         }
 
-        System.out.println("Packet before injection: " + ByteBufUtils.toHexString(buffer));
+        logger.debug("Packet before injection: {}", ByteBufUtils.toHexString(buffer));
 
         buffer.resetReaderIndex();
         ByteBuf originalPacket = buffer.copy();
@@ -163,7 +173,7 @@ public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter
         originalPacket.release();
 
         String hexData = ByteBufUtils.toHexString(modifiedPacket);
-        System.out.println("Handshake packet with injected IP (Hex): " + hexData);
+        logger.debug("Handshake packet with injected IP (Hex): {}", hexData);
 
         connectToRemote(ctx, modifiedPacket);
     }
@@ -185,104 +195,126 @@ public class MinecraftHandshakeCheckHandler extends ChannelInboundHandlerAdapter
      * 執行 DNS 解析，並與遠端伺服器建構連線；成功連線後轉發 initialData
      */
     private void connectToRemote(ChannelHandlerContext ctx, ByteBuf initialData) {
-        System.out.println("Starting DNS resolution for remote host: " + remoteHost + ":" + remotePort);
+        logger.info("Starting DNS resolution for remote host: {}:{}", remoteHost, remotePort);
         EventLoop eventLoop = ctx.channel().eventLoop();
         AddressResolver<InetSocketAddress> resolver = resolverGroup.getResolver(eventLoop);
 
+        // 執行 DNS 解析
         resolver.resolve(InetSocketAddress.createUnresolved(remoteHost, remotePort))
-                .addListener((Future<InetSocketAddress> future) -> {
-                    if (!future.isSuccess()) {
-                        System.err.println("DNS resolution failed for " + remoteHost + ":" + remotePort);
-                        future.cause().printStackTrace();
-                        ctx.close();
+                .addListener((Future<InetSocketAddress> dnsFuture) -> {
+                    if (!dnsFuture.isSuccess()) {
+                        handleDnsFailure(dnsFuture.cause(), ctx);
                         return;
                     }
-
-                    InetSocketAddress resolved = future.getNow();
-                    System.out.println("DNS resolution successful: " + resolved);
-
-                    Bootstrap b = new Bootstrap();
-                    b.group(eventLoop)
-                            .channel(NioSocketChannel.class)
-                            .option(ChannelOption.AUTO_READ, false)
-                            .handler(new ChannelInitializer<Channel>() {
-                                @Override
-                                protected void initChannel(Channel ch) {
-                                    ChannelPipeline p = ch.pipeline();
-                                    p.addLast(new RelayHandler(ctx.channel()));
-                                    System.out.println("RelayHandler added to remote channel pipeline.");
-                                }
-                            });
-
-                    b.connect(resolved).addListener((ChannelFutureListener) cf -> {
-                        if (!cf.isSuccess()) {
-                            System.err.println("Failed to connect to remote server: " + resolved);
-                            cf.cause().printStackTrace();
-                            ctx.close();
-                            return;
-                        }
-
-                        Channel remoteChannel = cf.channel();
-                        System.out.println("Successfully connected to remote server: " + resolved);
-
-                        // 先把最初的那個 initialData 寫到遠端
-                        remoteChannel.writeAndFlush(initialData).addListener((ChannelFutureListener) writeFuture -> {
-                            if (!writeFuture.isSuccess()) {
-                                System.err.println("Failed to forward initial data to remote server.");
-                                writeFuture.cause().printStackTrace();
-                                ctx.close();
-                                remoteChannel.close();
-                            } else {
-                                System.out.println("Initial data forwarded to remote server.");
-                            }
-                        });
-
-                        // ========= 關鍵：把 pendingQueue 裡面尚未處理的資料一併丟過去 =========
-                        flushPendingQueueToRemote(remoteChannel);
-
-                        // 之後再修改 pipeline，改用 RelayHandler 雙向轉發
-                        eventLoop.execute(() -> {
-                            if (ctxRef.pipeline().get("handshakeHandler") != null) {
-                                ctxRef.pipeline().remove("handshakeHandler");
-                                ctxRef.pipeline().addLast("relay", new RelayHandler(remoteChannel));
-                            }
-                        });
-                        // ==================================================================
-
-                        ctx.channel().config().setAutoRead(true);
-                        remoteChannel.config().setAutoRead(true);
-                        System.out.println("RelayHandler set up for bi-directional data forwarding.");
-                    });
+                    // 若成功解析，繼續進行連線
+                    InetSocketAddress resolvedAddress = dnsFuture.getNow();
+                    handleDnsSuccess(resolvedAddress, ctx, eventLoop, initialData);
                 });
+    }
+
+    /** DNS 解析失敗時的處理 */
+    private void handleDnsFailure(Throwable cause, ChannelHandlerContext ctx) {
+        logger.error("DNS resolution failed for {}:{}", remoteHost, remotePort, cause);
+        ctx.close();
+    }
+
+    /** DNS 解析成功時，使用解析出來的位址去連線 */
+    private void handleDnsSuccess(InetSocketAddress resolvedAddress, ChannelHandlerContext ctx, EventLoop eventLoop, ByteBuf initialData) {
+        logger.info("DNS resolution successful: {}", resolvedAddress);
+
+        // 建立 Bootstrap，準備連線
+        Bootstrap bootstrap = createRemoteBootstrap(eventLoop, ctx);
+
+        // 與遠端建立連線
+        bootstrap.connect(resolvedAddress).addListener((ChannelFutureListener) connectFuture -> {
+            if (!connectFuture.isSuccess()) {
+                handleConnectFailure(connectFuture.cause(), resolvedAddress, ctx);
+                return;
+            }
+            // 連線成功後處理
+            handleConnectSuccess(connectFuture.channel(), ctx, eventLoop, initialData);
+        });
+    }
+
+    /** 建立與遠端連線所需的 Bootstrap */
+    private Bootstrap createRemoteBootstrap(EventLoop eventLoop, ChannelHandlerContext ctx) {
+        return new Bootstrap()
+                .group(eventLoop)
+                .channel(NioSocketChannel.class)
+                .option(ChannelOption.AUTO_READ, false)
+                .handler(new ChannelInitializer<Channel>() {
+                    @Override
+                    protected void initChannel(Channel ch) {
+                        ChannelPipeline pipeline = ch.pipeline();
+                        pipeline.addLast(new RelayHandler(ctx.channel()));
+                        logger.debug("RelayHandler added to remote channel pipeline.");
+                    }
+                });
+    }
+
+    /** 與遠端連線失敗時的處理 */
+    private void handleConnectFailure(Throwable cause, InetSocketAddress resolvedAddress, ChannelHandlerContext ctx) {
+        logger.error("Failed to connect to remote server: {}", resolvedAddress, cause);
+        ctx.close();
+    }
+
+    /** 與遠端連線成功後，轉發 initialData，並處理其他工作 */
+    private void handleConnectSuccess(Channel remoteChannel, ChannelHandlerContext ctx, EventLoop eventLoop, ByteBuf initialData) {
+        logger.info("Successfully connected to remote server: {}", remoteChannel.remoteAddress());
+
+        // 先把最初的 initialData 寫到遠端
+        remoteChannel.writeAndFlush(initialData).addListener((ChannelFutureListener) writeFuture -> {
+            if (writeFuture.isSuccess()) {
+                logger.debug("Initial data forwarded to remote server.");
+                return;
+            }
+            logger.error("Failed to forward initial data to remote server.", writeFuture.cause());
+            ctx.close();
+            remoteChannel.close();
+        });
+
+        // 將 pendingQueue 裡面尚未處理的資料一併丟過去
+        flushPendingQueueToRemote(remoteChannel);
+
+        // 之後再修改 pipeline，改用 RelayHandler 進行雙向轉發
+        eventLoop.execute(() -> {
+            if (ctxRef.pipeline().get("handshakeHandler") == null) return;
+            ctxRef.pipeline().remove("handshakeHandler");
+            ctxRef.pipeline().addLast("relay", new RelayHandler(remoteChannel));
+        });
+
+        // 啟用雙向自動讀取
+        ctx.channel().config().setAutoRead(true);
+        remoteChannel.config().setAutoRead(true);
+
+        logger.info("RelayHandler set up for bi-directional data forwarding.");
     }
 
     /**
      * 一次性把 pendingQueue 裡所有「尚未送」到後端的資料，全部 writeAndFlush。
      */
     private void flushPendingQueueToRemote(Channel remoteChannel) {
-        System.out.println("Flushing pendingQueue to remote...");
-        while (!pendingQueue.isEmpty()) {
-            ByteBuf queuedData = pendingQueue.poll();
-            if (queuedData != null && queuedData.isReadable()) {
-                // 這裡要特別小心，因為 queuedData 是我們 retainedDuplicate() 來的
-                // 如果這裡要繼續用，就不建議再 copy，直接 forward。
-                remoteChannel.writeAndFlush(queuedData).addListener(f -> {
-                    if (!f.isSuccess()) {
-                        System.err.println("Failed to flush queued data to remote.");
-                        f.cause().printStackTrace();
-                    }
-                });
-            } else if (queuedData != null) {
-                // 若不可讀就直接釋放
+        logger.debug("Flushing pendingQueue to remote...");
+
+        ByteBuf queuedData;
+        while ((queuedData = pendingQueue.poll()) != null) {
+            // 先判斷是否可讀，不可讀就直接釋放
+            if (!queuedData.isReadable()) {
                 queuedData.release();
+                continue;
             }
+
+            // 若可讀則直接 forward 到 remoteChannel
+            remoteChannel.writeAndFlush(queuedData).addListener(writeFuture -> {
+                if (writeFuture.isSuccess()) return;
+                logger.error("Failed to flush queued data to remote.", writeFuture.cause());
+            });
         }
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        System.err.println("Exception in MinecraftHandshakeCheckHandler:");
-        cause.printStackTrace();
+        logger.error("Exception in MinecraftHandshakeCheckHandler:", cause);
         ctx.close();
     }
 }
