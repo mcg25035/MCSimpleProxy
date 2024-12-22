@@ -75,20 +75,21 @@ public class NettyMinecraftProxy {
             ServerBootstrap b = new ServerBootstrap()
                     .group(bossGroup, workerGroup)
                     .channel(NioServerSocketChannel.class)
-                    .handler(new LoggingHandler(LogLevel.INFO)) // Add logging handler to server bootstrap
+                    .handler(new LoggingHandler(LogLevel.INFO))
                     .childHandler(new ChannelInitializer<SocketChannel>() {
                         @Override
                         protected void initChannel(SocketChannel ch) {
                             ChannelPipeline p = ch.pipeline();
-                            p.addLast(new LoggingHandler(LogLevel.DEBUG)); // Add debug logging for each connection
-                            p.addLast(new MinecraftHandshakeCheckHandler(REMOTE_HOST, REMOTE_PORT, resolverGroup));
+                            p.addLast("debugLogger", new LoggingHandler(LogLevel.DEBUG));
+                            // 幫 MinecraftHandshakeCheckHandler 取名為 "handshakeHandler"
+                            p.addLast("handshakeHandler", new MinecraftHandshakeCheckHandler(REMOTE_HOST, REMOTE_PORT, resolverGroup));
                             System.out.println("Initialized channel pipeline for new connection.");
                         }
                     });
 
             // Bind the server to the specified port
             ChannelFuture f = b.bind(LISTEN_PORT).sync();
-            System.out.println("Done (codingbear's minecraft proxy)!");
+            System.out.println("[11:45:14 INFO]: Done (114.514s)!");
             System.out.println("Proxy listening on port " + LISTEN_PORT);
 
             // Wait until the server socket is closed
@@ -183,8 +184,7 @@ public class NettyMinecraftProxy {
 
         private void handleOldPing(ChannelHandlerContext ctx) {
             System.out.println("Handling old ping packet.");
-            // Old ping packets typically start with 0xFE, adjust based on protocol
-            if (buffer.readableBytes() < 1) { // Ensure there is enough data
+            if (buffer.readableBytes() < 1) {
                 System.out.println("Not enough data for old ping packet. Waiting for more data.");
                 buffer.resetReaderIndex();
                 return;
@@ -206,20 +206,16 @@ public class NettyMinecraftProxy {
             String clientIp = clientAddress.getAddress().getHostAddress();
 
             System.out.println("Injecting client IP into the packet.");
-            // Inject client IP into the beginning of the packet
             ByteBuf modifiedPacket = injectClientIpAtStart(originalPacket, clientIp);
             originalPacket.release();
 
             System.out.println("Valid old ping packet received. Forwarding to remote server.");
 
-            // Print the data being sent
             String hexData = byteBufToHex(modifiedPacket);
             System.out.println("Sending data with injected IP to remote server (Hex): " + hexData);
 
-            // Forward the modified packet to the remote server
             connectToRemote(ctx, modifiedPacket);
         }
-
 
         private ByteBuf injectClientIpAtStart(ByteBuf originalPacket, String clientIp) {
             ByteBuf modifiedPacket = Unpooled.buffer();
@@ -233,8 +229,6 @@ public class NettyMinecraftProxy {
 
             return modifiedPacket;
         }
-
-
 
         private void handleNewProtocol(ChannelHandlerContext ctx) {
             System.out.println("Handling new protocol packet.");
@@ -264,38 +258,29 @@ public class NettyMinecraftProxy {
             // It's a handshake packet; initiate connection to remote server
             System.out.println("Handshake packet detected. Initiating connection to remote server.");
 
-            // Reset the reader index to the start to forward the entire packet
             buffer.resetReaderIndex();
-
-            // Copy the original buffer to forward to the remote server
             ByteBuf originalPacket = buffer.copy();
-            buffer.clear(); // Clear buffer for future reads
+            buffer.clear();
 
-            // Get client IP address
+            System.out.println("Remote Address: " + ctx.channel().remoteAddress());
             InetSocketAddress clientAddress = (InetSocketAddress) ctx.channel().remoteAddress();
             String clientIp = clientAddress.getAddress().getHostAddress();
-            System.out.println("Injecting client IP: " + clientIp);
 
-            // Inject the client IP into the beginning of the packet
+            System.out.println("Injecting client IP into the packet.");
             ByteBuf modifiedPacket = injectClientIpAtStart(originalPacket, clientIp);
-
-            // Release the original packet as it is no longer needed
             originalPacket.release();
 
-            // Print the data being sent
             String hexData = byteBufToHex(modifiedPacket);
             System.out.println("Sending handshake data with injected IP to remote server (Hex): " + hexData);
 
             connectToRemote(ctx, modifiedPacket);
         }
 
-
         private void connectToRemote(ChannelHandlerContext ctx, ByteBuf initialData) {
             System.out.println("Starting DNS resolution for remote host: " + remoteHost + ":" + remotePort);
             EventLoop eventLoop = ctx.channel().eventLoop();
             AddressResolver<InetSocketAddress> resolver = resolverGroup.getResolver(eventLoop);
 
-            // Start asynchronous DNS resolution
             resolver.resolve(InetSocketAddress.createUnresolved(remoteHost, remotePort)).addListener((Future<InetSocketAddress> future) -> {
                 if (!future.isSuccess()) {
                     System.err.println("DNS resolution failed for " + remoteHost + ":" + remotePort);
@@ -307,9 +292,8 @@ public class NettyMinecraftProxy {
                 InetSocketAddress resolved = future.getNow();
                 System.out.println("DNS resolution successful: " + resolved);
 
-                // Set up a new Bootstrap to connect to the resolved remote server
                 Bootstrap b = new Bootstrap();
-                b.group(ctx.channel().eventLoop())
+                b.group(eventLoop)
                         .channel(NioSocketChannel.class)
                         .option(ChannelOption.AUTO_READ, false)
                         .handler(new ChannelInitializer<SocketChannel>() {
@@ -321,7 +305,6 @@ public class NettyMinecraftProxy {
                             }
                         });
 
-                // Connect to the remote server
                 b.connect(resolved).addListener((ChannelFutureListener) cf -> {
                     if (!cf.isSuccess()) {
                         System.err.println("Failed to connect to remote server: " + resolved);
@@ -333,7 +316,6 @@ public class NettyMinecraftProxy {
                     Channel remoteChannel = cf.channel();
                     System.out.println("Successfully connected to remote server: " + resolved);
 
-                    // Forward the initial data to the remote server
                     remoteChannel.writeAndFlush(initialData).addListener((ChannelFutureListener) writeFuture -> {
                         if (!writeFuture.isSuccess()) {
                             System.err.println("Failed to forward initial data to remote server.");
@@ -345,8 +327,16 @@ public class NettyMinecraftProxy {
                         }
                     });
 
-                    // Replace the current handler with RelayHandler for bi-directional data forwarding
-                    ctx.pipeline().replace(MinecraftHandshakeCheckHandler.this, "relay", new RelayHandler(remoteChannel));
+                    // ========= 改成「先移除再加」的關鍵修正 =========
+                    eventLoop.execute(() -> {
+                        // 確認 pipeline 中還有 "handshakeHandler" 就移除它
+                        if (ctx.pipeline().get("handshakeHandler") != null) {
+                            ctx.pipeline().remove("handshakeHandler");
+                            ctx.pipeline().addLast("relay", new RelayHandler(remoteChannel));
+                        }
+                    });
+                    // ==========================================
+
                     ctx.channel().config().setAutoRead(true);
                     remoteChannel.config().setAutoRead(true);
                     System.out.println("RelayHandler set up for bi-directional data forwarding.");
@@ -372,13 +362,6 @@ public class NettyMinecraftProxy {
 
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
-//            System.out.println("Relaying data from source to target channel.");
-
-            // Convert the data to Hex for debugging
-//            ByteBuf buf = (ByteBuf) msg;
-//            String hexData = byteBufToHex(buf);
-//            System.out.println("Sending data to target server (Hex): " + hexData);
-
             targetChannel.writeAndFlush(msg).addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
                     System.err.println("Failed to relay data to target channel.");
